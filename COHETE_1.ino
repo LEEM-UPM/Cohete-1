@@ -5,8 +5,6 @@
 #include <TinyGPS++.h>
 #include <SoftwareSerial.h>
 #include <Adafruit_BMP280.h>
-#include <Adafruit_Sensor.h>
-#include <Adafruit_ADXL345_U.h>
 //#include "DHT.h"
 
 // Lista de dispositivos del Cohete 1 7/ABR/22
@@ -29,11 +27,16 @@
 //              Parámetros Cohete
 //-------------------------------------------------
 #define ACELERACION_INICIO             2.0          // g
-#define APOGEO                         5000         // ms
-#define TIEMPO_ALARMA                  30000        // ms
 #define GRAVEDAD                       9.81         // m/s^2
-#define TIEMPO_LANZAMIENTO             30000       // ms
-#define TIEMPO_MEDIDA_ALTURA_REF       5000         // ms
+#define TIEMPO_LANZAMIENTO             240000       // ms (Tiempo de espera desde que hay señal GPS)
+#define DIF_ALTURA_APERTURA            20.0         // m
+#define DIF_ALTURA_ALARMA              200.0        // m
+#define T_MIN_ALARMA                   30000        // ms
+#define T_MIN_PARACAIDAS               4000         // ms
+#define T_MAX_PARACAIDAS               13000        // ms
+#define DIF_ALTURA_APERTURA            20.0         // m
+#define DIF_ALTURA_ALARMA              200.0        // m
+#define T_MIN_ALARMA                   30000        // ms
 
 
 //-------------------------------------------------
@@ -53,16 +56,24 @@
 //              MODULOS Y SENSORES
 //-------------------------------------------------
 
+//Control apertura
+float alt_max = 0.0;
+uint16_t t_inicio = 0;
+#define FLIGHT_TIME millis() - t_inicio
+
 // Servomotores
-Servo *servoMotor1;
-Servo *servoMotor2;
+Servo servoMotor1;
+Servo servoMotor2;
 
 // Sensor aceleración ADXL345
-Adafruit_ADXL345_Unified accel = Adafruit_ADXL345_Unified();
+const int ADXL345 = 0x53; // Direccion I2C
+float X_out, Y_out, Z_out;
+#define OFFSET_X 0.00
+#define OFFSET_Y 0.00
+#define OFFSET_Z 0.16
 
 // Sensor de presión BMP280
 Adafruit_BMP280* bmp = new Adafruit_BMP280;
-
 
 /*// Sensor de humedad DHT11
 #define DHTTYPE DHT11
@@ -100,9 +111,6 @@ unsigned int tiempo_de_vuelo; //CREO QUE ESTA NO LA UTILIZAS
 float presion_min = 99999999999;
 
 // Variables
-float X_out;
-float Y_out;
-float Z_out;
 float temperatura_BMP;
 float altura_BMP;
 float presion_BMP;
@@ -136,13 +144,8 @@ void setup()
   alarma_off();
 
 // Verificación funcionamiento acelerómetro ADXL345
-  if(!accel.begin())
-   {
-    Serial.print("Fallo en el sensor ADXL345");  
-    error_inicio();
-   }
- accel.setRange(ADXL345_RANGE_16_G);
-
+  ADXL345_16g_init();
+  
 // Verificación funcionamiento sensor de presión BMP280
   if (!bmp->begin()) 
   {
@@ -176,9 +179,7 @@ void setup()
 // 2.- ESPERANDO SEÑAL DEL GPS VÁLIDA
 
   ss->begin(GPSBaud);
-  
-  uint16_t var = millis();
-  
+
   while (!gps->location.isValid()) 
   {
     while (ss->available()) 
@@ -198,20 +199,23 @@ void setup()
     // Serial.println(presion_referencia);
 
 
+// 4.- ESPERAR TIEMPO DE LANZAMIENTO
+
+  uint16_t var = millis();
+  t_inicio = millis(); 
   while (true) 
   {    
     if ((millis() - var) >= TIEMPO_LANZAMIENTO) 
     {
       break;
     }
-  
   }
 
-    Serial.println("Inicialización correcta y establecida la presión de referencia, listos para el lanzamiento");
-    alarma_on();
-    delay(5000);
-    alarma_off();
-    digitalWrite(PIN_LED_ERROR, HIGH);
+  Serial.println("Inicialización correcta y establecida la presión de referencia, listos para el lanzamiento");
+  alarma_on();
+  delay(5000);
+  alarma_off();
+  digitalWrite(PIN_LED_ERROR, HIGH);
 }
 
 
@@ -238,12 +242,7 @@ void loop()
   Serial.print(",");
 
 // Datos del ADXL345
-  sensors_event_t event; 
-  accel.getEvent(&event);
-  
-  X_out = event.acceleration.x/GRAVEDAD;
-  Y_out = event.acceleration.y/GRAVEDAD;
-  Z_out = event.acceleration.z/GRAVEDAD;
+  ADXL345_16g_read_acc();
 
   Serial.print(X_out);
   Serial.print(",");
@@ -306,11 +305,11 @@ void loop()
                APERTURA PARACAIDAS
 *********************************************************/
 
-  if (presion_BMP < presion_min)
+  if (altura_BMP > alt_max && (FLIGHT_TIME < T_MIN_PARACAIDAS)) 
   {
-    presion_min = presion_BMP;
+    alt_max = altura_BMP;
   }
-  
+
   if (!condicion_aceleracion && abs(Z_out) > ACELERACION_INICIO)  
   {
     condicion_aceleracion = true;
@@ -319,21 +318,21 @@ void loop()
     archivo->write("DD");
   }
 
-   if (!condicion_presion && condicion_aceleracion && (presion_min < 0.9 * presion_BMP || (millis() - tiempo_de_vuelo) > APOGEO))
+   if ((alt_max > (altura_BMP + DIF_ALTURA_APERTURA) && FLIGHT_TIME < T_MIN_PARACAIDAS)  ||  FLIGHT_TIME > T_MAX_PARACAIDAS)
   {
     condicion_presion = true;
     paracaidas_open();
     digitalWrite(PIN_LED_ERROR, HIGH);
     archivo->write("AA");
+    alt_max = altura_BMP;
   }
 
-   if (!condicion_alarma && condicion_presion && (millis()-tiempo_de_vuelo) > TIEMPO_ALARMA)
+  if ( (alt_max > (altura_BMP + DIF_ALTURA_ALARMA)) || FLIGHT_TIME > T_MIN_ALARMA)  
   {
-    condicion_alarma = true;
     alarma_on();
   }
-
   
+
   if (millis() - tiempo < 10)
   {
     delay(10-millis()+tiempo); //delay de lo que falta para llegar a 10
